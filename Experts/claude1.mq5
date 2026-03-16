@@ -3,8 +3,9 @@
 //|            SMC Liquidity Sweep + IFVG Entry Strategy            |
 //|                                                                  |
 //|  Flow:                                                           |
-//|   1. Mark Asian & London session highs/lows each day            |
-//|   2. Detect sweep: wick pierces level, candle closes back inside |
+//|   1. At day open: lock in PREVIOUS day's Asian & London H/L     |
+//|   2. During the day: detect sweep of those levels               |
+//|      (wick pierces level, candle closes back inside)            |
 //|   3. Scan lower TF for IFVG created during the sweep impulse    |
 //|   4. Enter when price retraces into the IFVG zone               |
 //|   5. 1:2 Risk-to-Reward (TP = 2x SL distance)                  |
@@ -74,9 +75,10 @@ SessionLevels g_london;
 SweepState    g_sweep;
 IFVGZone      g_ifvg;
 
-datetime      g_lastDay  = 0;
-datetime      g_lastBar  = 0;
-double        g_pip      = 0.0;
+datetime      g_lastDay     = 0;
+datetime      g_lastBar     = 0;
+double        g_pip         = 0.0;
+bool          g_levelsBuilt = false;  // previous-day levels only need one scan per day
 
 const string  OBJ_ASIAN_H = "SMC_AsianH";
 const string  OBJ_ASIAN_L = "SMC_AsianL";
@@ -88,7 +90,7 @@ const string  OBJ_SWEEP   = "SMC_Sweep";
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   g_trade.SetMagicNumber(InpMagicNumber);
+   // g_trade.SetMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(20);
    g_pip = (_Digits == 5 || _Digits == 3) ? _Point * 10.0 : _Point;
    ResetDay();
@@ -138,9 +140,10 @@ void ResetDay()
    g_asian.highSwept = false;  g_asian.lowSwept = false;
    g_london.high    = 0;       g_london.low     = DBL_MAX;
    g_london.highSwept = false; g_london.lowSwept = false;
-   g_sweep.type     = SWEEP_NONE;
+   g_sweep.type       = SWEEP_NONE;
    g_sweep.entryTaken = false;
-   g_ifvg.valid     = false;
+   g_ifvg.valid       = false;
+   g_levelsBuilt      = false;
    ObjectsDeleteAll(0, "SMC_");
   }
 
@@ -155,23 +158,33 @@ bool HasOpenTrade()
   }
 
 //+------------------------------------------------------------------+
-//| Scan SweepTF bars for today to build session highs/lows          |
+//| Scan SweepTF bars from the PREVIOUS trading day to lock in the  |
+//| Asian and London session highs/lows as today's key levels.       |
+//| Only runs once per day (g_levelsBuilt flag).                     |
 //+------------------------------------------------------------------+
 void BuildSessionLevels(MqlDateTime &dt)
   {
+   if(g_levelsBuilt) return;
+
    datetime today = StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
    int maxBars = iBars(_Symbol, InpSweepTF);
 
-   double aH = 0, aL = DBL_MAX;
-   double lH = 0, lL = DBL_MAX;
+   double   aH = 0, aL = DBL_MAX;
+   double   lH = 0, lL = DBL_MAX;
+   datetime prevDay = 0;
 
    for(int i = 0; i < maxBars; i++)
      {
       datetime t = iTime(_Symbol, InpSweepTF, i);
-      if(t < today) break;
+      if(t >= today) continue;           // skip today's bars
 
       MqlDateTime bd;
       TimeToStruct(t, bd);
+      datetime barDay = StringToTime(StringFormat("%04d.%02d.%02d", bd.year, bd.mon, bd.day));
+
+      if(prevDay == 0)        prevDay = barDay;  // latch onto the first (most recent) prev day
+      else if(barDay < prevDay) break;            // moved past that day — stop
+
       double barH = iHigh(_Symbol, InpSweepTF, i);
       double barL = iLow(_Symbol,  InpSweepTF, i);
 
@@ -187,8 +200,15 @@ void BuildSessionLevels(MqlDateTime &dt)
         }
      }
 
-   if(aH > 0) { g_asian.high = aH; g_asian.low = aL; }
+   if(aH > 0) { g_asian.high  = aH; g_asian.low  = aL; }
    if(lH > 0) { g_london.high = lH; g_london.low = lL; }
+
+   if(aH > 0 || lH > 0)
+     {
+      g_levelsBuilt = true;
+      PrintFormat("[SMC] Prev-day levels locked — Asian H=%.5f L=%.5f | London H=%.5f L=%.5f",
+                  g_asian.high, g_asian.low, g_london.high, g_london.low);
+     }
   }
 
 //+------------------------------------------------------------------+
